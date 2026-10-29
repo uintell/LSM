@@ -1,0 +1,5 @@
+/lsm
+/neural-topology
+*.o
+*.core
+core

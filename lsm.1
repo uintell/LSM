@@ -1,0 +1,287 @@
+.TH LSM 1 "2026-10-29" "lsm 4.1" "User Commands"
+.SH NAME
+lsm \- Linux system monitor with OpenGL graphs and editable 3D topology
+.SH SYNOPSIS
+.B lsm
+.RB [ \-\-view " VIEW"]
+.RB [ \-\-root " PATH"]
+.br
+.B lsm
+.RB [ \-\-check " | " \-\-smoke ]
+.RB [ \-\-view " VIEW"]
+.RB [ \-\-root " PATH"]
+.br
+.B lsm
+.BR \-\-help " | " \-h " | " \-\-version
+.SH DESCRIPTION
+.B lsm
+is a native C Linux system monitor using OpenGL for its interface,
+2D histories and 3D graphs.
+It displays CPU cores, available GPU telemetry, process activity,
+memory accounting, pressure stalls, process ancestry and directory metadata.
+Collection runs in background threads independently of rendering.
+.PP
+Normal operation requires a graphical desktop and an OpenGL compatibility
+context. Root privileges are not required to start the program.
+Access to individual processes, memory mappings, memory bytes and hardware
+counters follows normal Linux permissions.
+.SH OPTIONS
+.TP
+.BI \-\-view " VIEW"
+Open a named view:
+.B overview, cpu, gpu, processes, pressure, ram, tree, files, manual.
+The default is
+.BR overview .
+.TP
+.BI \-\-root " PATH"
+Set the initial filesystem root. The default is the current working directory,
+or the filesystem root if the working directory cannot be obtained.
+This option does not select the Filesystem view automatically.
+.TP
+.B \-\-check
+Run collector, parser, memory, topology and interaction checks, then exit.
+No graphical display is needed. Signal tests use temporary child processes;
+byte tests read controlled data in the test process; filesystem tests create
+and remove temporary fixtures.
+.TP
+.B \-\-smoke
+Run graphical checks and exit. Tests traverse all views, change the window
+size, briefly request fullscreen, and exercise process dialogs, memory
+inspection and topology editing. Tests signal only their own temporary
+children and use temporary filesystem fixtures.
+.TP
+.BR \-h , " \-\-help"
+Print command-line help and exit.
+.TP
+.B \-\-version
+Print the program name and version and exit.
+.SH VIEWS
+Click a navigation tab or press its number when no text field, dialog or
+inspector is capturing keyboard input.
+.TP
+.B 1 Overview
+Resource summaries, 3D CPU history, memory history and disk throughput.
+.TP
+.B 2 CPU
+Per-logical-CPU activity, clocks, physical topology and available temperatures.
+Click a core for its user, system and I/O-wait breakdown.
+.TP
+.B 3 GPU
+Discovered devices, driver and PCI details, engine activity, clocks,
+resident memory and available temperature and power counters.
+Use the device and graph buttons to change the GPU or 2D/3D view;
+scroll to see more telemetry.
+.TP
+.B 4 Processes
+Searchable process table with sortable columns, selected-process details,
+inspection, End and Kill controls.
+.TP
+.B 5 Pressure
+CPU, memory and I/O pressure stall information, 10/60/300-second averages
+and measured histories. These values describe stalled time.
+.TP
+.B 6 RAM
+System memory categories and largest processes by resident size.
+Click a process to inspect its mappings.
+.TP
+.B 7 Process tree
+Live 3D parent/child relationships from observed PPIDs.
+Arrowheads point toward children. The synthetic Visible roots node groups
+processes whose parents are outside the view.
+Edges represent ancestry; IPC, sockets and historical lifetimes are not shown.
+.TP
+.B 8 Filesystem
+Bounded 3D directory metadata snapshot with navigation and visual node editing.
+.TP
+.B 9 Manual
+In-app reference. Scroll with the wheel, arrow keys or Page Up/Down;
+Home and End jump to the beginning and end.
+.SH GENERAL CONTROLS
+.TP
+.B F
+Toggle fullscreen.
+.TP
+.B Space
+Freeze or resume the displayed snapshot. Background collection continues.
+.TP
+.B V
+Cycle history windows of 1, 5 and 15 minutes.
+The History button performs the same action.
+.TP
+.B Hover or click a 2D graph
+Hover to inspect a measured sample; click to pin or unpin the shared time cursor.
+Press C to clear it. The cursor does not rewind process tables,
+topology, filesystem snapshots or memory bytes.
+.TP
+.B Drag a panel divider
+Resize graph and detail panels in Overview, GPU and topology views.
+.TP
+.B Left-drag a CPU/GPU 3D history
+Orbit the graph. The wheel or +/\- zooms; R resets its camera.
+.TP
+.B Escape
+Cancel a confirmation, leave a search or close the inspector first.
+In topology, cancel an active gesture or deselect.
+Elsewhere, exit the application.
+.SH PROCESS CONTROLS
+In Processes, press / or click the search field to filter by name, command
+or PID. Click a column heading to sort and click it again to reverse.
+Select a process row before using the following controls.
+.TP
+.B I
+Open or close the process inspector. Inspector keys 1, 2 and 3 select CPU,
+RAM and I/O histories; 4 or M opens Maps; 5 or B requests Bytes.
+.TP
+.B T
+Open End, which sends SIGTERM after confirmation.
+.TP
+.B K
+Open Kill, which sends SIGKILL after confirmation.
+SIGKILL terminates the process immediately and can lose unsaved work.
+.PP
+Verify the named target in the dialog. Enter confirms; Escape cancels.
+Only the selected process is signaled, not its descendants.
+The program checks PID/start-time identity and uses a pidfd to avoid signaling
+a different process after PID reuse. PID 1 and lsm itself are protected.
+The kernel enforces signal permissions; lsm does not elevate privileges.
+.SH MEMORY INSPECTION
+Maps shows mapping permissions, resident memory, proportional memory and
+mapped names. Cycle the type button to filter regions; S changes sorting
+between resident size and address. The wheel scrolls the list.
+At most 4,096 regions are listed; summary accounting includes additional regions.
+.PP
+Select a readable region and request Bytes to read at most 256 bytes from
+.IR /proc/PID/mem .
+Prev, Next and Reload issue explicit additional requests.
+Raw bytes are not refreshed automatically.
+Access denial or an exited target is reported without bypassing kernel
+debugging permissions.
+.PP
+RSS includes shared resident pages. PSS apportions them among processes.
+System RAM categories overlap and must not be summed as independent totals.
+Labels such as heap and stack do not decode application objects.
+.SH TOPOLOGY EDITING
+These controls apply to Process tree and Filesystem.
+.TP
+.B Left-click a node or label
+Select the visible node. Small nodes have expanded pick targets.
+.TP
+.B Left-drag a node
+Move its visual placement in the plane facing the camera.
+.TP
+.B Right-drag
+Orbit the camera.
+.TP
+.BR Middle-drag ", Shift+left-drag, or drag empty space"
+Pan the camera.
+.TP
+.B Wheel or +/\-
+Zoom.
+.TP
+.B R / Fit
+Fit the camera while keeping node placements.
+.TP
+.B Ctrl+Z
+Undo a visual node placement.
+.TP
+.B G / Reset
+Restore the automatic layout for the current scope.
+.TP
+.B Escape during a gesture
+Cancel the gesture and restore its previous placement or camera.
+.PP
+Visual edits do not change files or process PPIDs.
+Placements are scoped to the process subtree/filter or filesystem root.
+Process identities use PID and start time; file identities use full paths.
+Background collection continues while the rendered scene is held during a gesture.
+Placements, layout settings and undo history are bounded and kept for this session.
+.SS Process tree navigation
+Enter/Focus isolates the selected subtree; Backspace/Parent focuses its parent.
+A/All restores the full forest; U/Mine toggles the current user's processes.
+Press / to search a name or PID, then Enter to focus the first match.
+L/Follow tracks the selected PID/start-time identity and refits when its family
+changes. Manual camera or node gestures and explicit navigation end Follow.
+I, T and K provide the process inspector and signal dialogs.
+Family CPU is summed; family RSS can count shared pages more than once.
+.SS Filesystem navigation
+Enter opens the selected directory; Backspace/Up moves to its parent.
+The Home and / buttons select those roots.
+Press / or click the path field to type a directory, then Enter.
+Depth cycles through 1\-4 levels; H toggles hidden entries; Refresh rescans.
+.PP
+Scans read directory entries, stat metadata and symlink target text.
+Child symlinks are displayed without following them; mount points are shown
+but not descended into until explicitly entered.
+Snapshots contain at most 2,048 entries including the root and report truncation.
+Directory sizes are inode sizes, not recursive storage totals.
+Metadata may change during a scan; slow filesystems may delay completion.
+.SH METRICS AND LIMITS
+Samples are collected approximately once per second. Histories retain at most
+900 measured samples using monotonic timestamps and fill from live data.
+No history is saved across restarts. Process CPU uses 100 percent per logical
+CPU and can exceed 100 percent. System memory utilization uses MemAvailable.
+.PP
+The collector supports up to 1,024 CPU IDs, 32,768 processes and 16 GPUs.
+Overview's 3D graph draws the first 128 CPU IDs. Process tree displays at most
+4,095 processes plus its grouping node.
+.PP
+CPU, memory, processes, network, disk and pressure counters come from procfs;
+hardware topology, clocks and sensors also use sysfs.
+Network totals exclude loopback but may double-count bridges and tunnels.
+Disk totals omit loop, RAM, device-mapper and md devices to reduce duplication.
+.PP
+Intel and AMD engine coverage depends on accessible DRM client counters.
+GPU utilization is the busiest visible engine, not a sum of engines.
+Client resident-memory sums can double-count shared buffers.
+Integrated GPUs share system RAM; no dedicated VRAM total is invented.
+NVIDIA uses optional dynamically loaded NVML; this backend does not provide
+engine-level splits. GPU discovery occurs at startup.
+Unavailable counters are labeled unavailable.
+Intel i915 has been tested on the development machine;
+AMD, xe and NVIDIA require validation on their hardware.
+.SH ENVIRONMENT
+.TP
+.B MONITOR_FONT
+Path to a monospace TrueType font. Otherwise lsm tries DejaVu Sans Mono,
+then falls back to FreeGLUT's built-in font.
+.TP
+.B LSM_CAPTURE_DIR
+Existing writable directory for PPM screenshots during
+.BR \-\-smoke .
+Files are named with the lsm prefix. Ignored in normal operation.
+.SH FILES
+.TP
+.I /proc
+Linux runtime counters, process identities, mappings and memory interfaces.
+.TP
+.I /sys
+Hardware, DRM, CPU topology and sensor interfaces.
+.TP
+.I libnvidia-ml.so.1
+Optional NVIDIA runtime library, loaded when available.
+.SH EXIT STATUS
+.TP
+.B 0
+Normal exit, successful checks, help or version.
+.TP
+.B 1
+Collector startup failure, failed checks or detected rendering failure.
+The graphics library may also terminate on display/context startup errors.
+.TP
+.B 2
+Invalid command-line arguments.
+.SH EXAMPLES
+.nf
+lsm
+lsm \-\-view tree
+lsm \-\-view files \-\-root /home
+lsm \-\-view manual
+lsm \-\-check
+man \-l ./lsm.1
+.fi
+.SH SEE ALSO
+.BR top (1),
+.BR ps (1),
+.BR kill (1),
+.BR proc (5),
+.BR pidfd_send_signal (2)
