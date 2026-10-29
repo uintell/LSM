@@ -6,6 +6,8 @@
 #include "explore.h"
 #include "interaction.h"
 #include "manual.h"
+#include "health.h"
+#include "coreplot.h"
 #include <errno.h>
 #include <ctype.h>
 #include <signal.h>
@@ -69,11 +71,62 @@ typedef struct {
 static const Color foreground = {.86f, .9f, .95f}, muted = {.45f, .53f, .64f},
                    cyan = {.23f, .83f, .96f}, purple = {.65f, .54f, 1}, green = {.3f, .87f, .66f},
                    orange = {1, .65f, .36f}, red = {1, .36f, .4f}, panel = {.055f, .072f, .105f};
+typedef struct {
+    const char *name;
+    Color cpu, ram, gpu, network, disk;
+} Palette;
+static const Palette palettes[] = {{"Spectrum",
+                                    {.28f, .67f, 1},
+                                    {.75f, .52f, 1},
+                                    {.18f, .88f, .68f},
+                                    {1, .82f, .35f},
+                                    {.43f, .75f, 1}},
+                                   {"Aurora",
+                                    {.22f, .9f, .86f},
+                                    {.47f, .65f, 1},
+                                    {.95f, .57f, .86f},
+                                    {.72f, .9f, .42f},
+                                    {.68f, .59f, 1}},
+                                   {"Ember",
+                                    {1, .77f, .4f},
+                                    {.83f, .59f, 1},
+                                    {.25f, .86f, .78f},
+                                    {.46f, .75f, 1},
+                                    {.96f, .65f, .86f}}};
+static int palette_index;
+#define palette (palettes[palette_index])
+static HealthReport view_health;
+static Snapshot *color_fixture;
+static Color health_color(HealthLevel level, Color normal) {
+    return level == HEALTH_DANGER    ? red
+           : level == HEALTH_WARNING ? orange
+           : level == HEALTH_UNKNOWN ? muted
+                                     : normal;
+}
+static Color utilization_color(double value, Color normal) {
+    return health_color(health_classify(value, HEALTH_UTILIZATION), normal);
+}
+static double process_capacity(double cpu) {
+    return view_metrics.cpu_count > 0 ? cpu / view_metrics.cpu_count : -1;
+}
+static double process_memory_percent(const Process *process) {
+    return view_memtotal > 0 ? 100.0 * process->rss_kib / (view_memtotal * 1048576) : -1;
+}
+static void cycle_palette(void) {
+    palette_index = (palette_index + 1) % (int)(sizeof palettes / sizeof palettes[0]);
+}
 #define VIEW_COUNT 9
 #define MANUAL_VIEW 8
 static int tab, core_scroll, selected_core, gpu_selected, process_scroll, sort_column = 3,
                                                                           sort_desc = 1;
 static int manual_scroll, manual_max_scroll;
+static int core_info_open, core_info_scroll, core_pointer_valid, core_pointer_x, core_pointer_y;
+static int plot_press, plot_moved, plot_press_x, plot_press_y;
+static float plot_press_yaw, plot_press_pitch;
+static CorePlot cpu_plot;
+static PickFrame cpu_plot_projection;
+static CorePlotHit core_hover, plot_press_hit;
+static int cpu_columns(void);
 static int topology_tab(void) {
     return tab == 6 || tab == 7;
 }
@@ -305,6 +358,50 @@ static int split_left(float ratio) {
         left = total - 220;
     return left;
 }
+static int core_panel_geometry(int *x, int *y, int *w, int *h) {
+    if (tab != 0 || !core_info_open)
+        return 0;
+    if (width < 900) {
+        *x = 24;
+        *y = 344;
+        *w = width - 48;
+        *h = height - 382;
+    } else {
+        int left = split_left(overview_ratio);
+        *x = 40 + left;
+        *y = 264;
+        *w = width - 64 - left;
+        *h = height - 302;
+    }
+    return *w > 0 && *h > 0;
+}
+static void core_step(int direction) {
+    int limit = view_metrics.cpu_limit;
+    if (limit < 1)
+        return;
+    for (int i = 0; i < limit; i++) {
+        selected_core = (selected_core + direction + limit) % limit;
+        if (view_metrics.cpus[selected_core].online)
+            break;
+    }
+    core_info_scroll = 0;
+}
+static int core_panel_click(int x, int y) {
+    int xx, yy, w, h;
+    if (!core_panel_geometry(&xx, &yy, &w, &h) || !inside(x, y, xx, yy, w, h))
+        return 0;
+    if (inside(x, y, xx + w - 82, yy + 10, 66, 34))
+        core_info_open = 0;
+    if (h >= 180 && inside(x, y, xx + 16, yy + h - 48, 46, 34))
+        core_step(-1);
+    if (h >= 180 && inside(x, y, xx + 70, yy + h - 48, 46, 34))
+        core_step(1);
+    if (h >= 180 && inside(x, y, xx + 124, yy + h - 48, w - 140, 34)) {
+        tab = 1;
+        core_scroll = selected_core / cpu_columns() * cpu_columns();
+    }
+    return 1;
+}
 static int topology_side_width(void) {
     return panel_sidebar_width(width, tab == 6 ? tree_panel_size : file_panel_size);
 }
@@ -437,17 +534,29 @@ static float peak(const float *values) {
 }
 static void chart_history(int x, int y, int w, int h, const char *title, const float *values,
                           int stride, float maximum, Color c, int cursor, int length,
-                          const double *timestamps, const char *unit) {
+                          const double *timestamps, const char *unit, HealthScale scale) {
     box(x, y, w, h);
     clip_text(x + 16, y + 24, w - 32, 13, muted, title);
     if (h < 90)
         return;
     int top = y + 44, bottom = y + h - 28;
+    if (maximum <= 0)
+        maximum = 1;
+    if (scale != HEALTH_NONE) {
+        float warning = (float)health_threshold(scale, HEALTH_WARNING);
+        float danger = (float)health_threshold(scale, HEALTH_DANGER);
+        float wy = bottom - (bottom - top) * fminf(warning / maximum, 1);
+        float dy = bottom - (bottom - top) * fminf(danger / maximum, 1);
+        color((Color){.18f, .105f, .055f});
+        rect(x + 16, dy, w - 32, wy - dy);
+        color((Color){.20f, .065f, .085f});
+        rect(x + 16, top, w - 32, dy - top);
+        color((Color){.55f, .18f, .22f});
+        line(x + 16, dy, x + w - 16, dy);
+    }
     color((Color){.12f, .16f, .21f});
     for (int i = 0; i < 4; i++)
         line(x + 16, top + (bottom - top) * i / 3.f, x + w - 16, top + (bottom - top) * i / 3.f);
-    if (maximum <= 0)
-        maximum = 1;
     double newest = length ? timestamps[(cursor + HISTORY - 1) % HISTORY] : 0;
     color(c);
     glLineWidth(1.5f);
@@ -463,12 +572,14 @@ static void chart_history(int x, int y, int w, int h, const char *title, const f
         double fraction = 1 - (newest - timestamps[idx]) / history_window;
         if (fraction < 0)
             continue;
+        color(scale == HEALTH_NONE ? c : health_color(health_classify(v, scale), c));
         glVertex2f(x + 16 + (w - 32) * fraction, bottom - (bottom - top) * fminf(v / maximum, 1));
     }
     glEnd();
     glLineWidth(1);
     if (length == 1 && values[((cursor + HISTORY - 1) % HISTORY) * stride] >= 0) {
         float v = values[((cursor + HISTORY - 1) % HISTORY) * stride];
+        color(scale == HEALTH_NONE ? c : health_color(health_classify(v, scale), c));
         glPointSize(4);
         glBegin(GL_POINTS);
         glVertex2f(x + w - 16, bottom - (bottom - top) * fminf(v / maximum, 1));
@@ -508,10 +619,10 @@ static void chart_history(int x, int y, int w, int h, const char *title, const f
             (ChartHit){x, y, w, h, stride, cursor, length, values, timestamps, unit};
 }
 static void chart(int x, int y, int w, int h, const char *title, const float *values, int stride,
-                  float maximum, Color c) {
+                  float maximum, Color c, HealthScale scale) {
     const char *unit = values == view_disk_history || values == view_net_history ? "MiB/s" : "%";
     chart_history(x, y, w, h, title, values, stride, maximum, c, view_head, view_samples,
-                  snapshot->data.timestamps, unit);
+                  snapshot->data.timestamps, unit, scale);
 }
 static const char *value(double v, const char *unit, char *s, size_t n) {
     if (v < 0)
@@ -520,25 +631,40 @@ static const char *value(double v, const char *unit, char *s, size_t n) {
         snprintf(s, n, "%.0f%s", v, unit);
     return s;
 }
-static void info(int x, int y, int w, const char *key, const char *val) {
+static const char *core_id_text(int id, char *text, size_t size) {
+    if (id < 0)
+        return "Unavailable";
+    snprintf(text, size, "%d", id);
+    return text;
+}
+static void info_tinted(int x, int y, int w, const char *key, const char *val, Color tint) {
     clip_text(x, y, w / 2 - 10, 13, muted, key);
-    clip_text(x + w / 2, y, w / 2, 13, foreground, val);
+    clip_text(x + w / 2, y, w / 2, 13, tint, val);
+}
+static void info(int x, int y, int w, const char *key, const char *val) {
+    info_tinted(x, y, w, key, val, foreground);
 }
 static void bar(int x, int y, int w, double v, Color c) {
     color((Color){.1f, .14f, .19f});
     rect(x, y, w, 5);
-    if (v >= 0) {
-        color(c);
+    color((Color){.3f, .18f, .07f});
+    rect(x + w * .85f, y, w * .10f, 5);
+    color((Color){.4f, .09f, .13f});
+    rect(x + w * .95f, y, w * .05f, 5);
+    if (v >= 0 && isfinite(v)) {
+        color(utilization_color(v, c));
         rect(x, y, w * fmin(v / 100, 1), 5);
     }
 }
 static void header(void) {
     color((Color){.04f, .054f, .08f});
-    rect(0, 0, width, 116);
-    label(24, 33, 22, foreground, "lsm 4.1");
-    if (width > 540)
-        label(166, 32, 12, muted, "RESOURCE DIAGNOSTICS");
+    rect(0, 0, width, 128);
+    label(24, 33, 22, foreground, "lsm 4.3");
     char s[256];
+    if (width > 640) {
+        snprintf(s, sizeof s, "%s / P", palette.name);
+        button(166, 12, 170, s, palette.cpu);
+    }
     snprintf(s, sizeof s, "%s  /  %s", view_metrics.hostname, view_metrics.kernel);
     clip_text(360, 32, width - 680, 12, muted, s);
     snprintf(s, sizeof s, "History %dm", history_window / 60);
@@ -582,11 +708,171 @@ static void header(void) {
              view_count, snapshot->collection_ms);
     if (width > 1800)
         label(width - 410, 85, 12, muted, s);
+    Color status = health_color(view_health.level, green);
+    color((Color){status.r * .13f, status.g * .13f, status.b * .13f});
+    rect(24, 108, width - 48, 20);
+    color(status);
+    rect(24, 108, 3, 20);
+    const char *state = view_health.level == HEALTH_UNKNOWN   ? "WAITING FOR DATA"
+                        : view_health.overloaded              ? "SYSTEM OVERLOAD"
+                        : view_health.level == HEALTH_DANGER  ? "DANGER ZONE"
+                        : view_health.level == HEALTH_WARNING ? "WARNING"
+                                                              : "NORMAL";
+    char health_text[384];
+    snprintf(health_text, sizeof health_text, "%s%s%s / %s", color_fixture ? "UI TEST DATA / " : "",
+             paused || topology_interacting() ? "HELD / " : "", state,
+             view_health.reasons[0] ? view_health.reasons
+                                    : "Utilization: amber >=85%, red >=95% | P: palette");
+    clip_text(34, 122, width - 68, 11, status, health_text);
+}
+static void core_details(void) {
+    int x, y, w, h;
+    if (!core_panel_geometry(&x, &y, &w, &h))
+        return;
+    if (selected_core < 0 || selected_core >= MAX_CPUS)
+        selected_core = 0;
+    const CpuInfo *c = &view_metrics.cpus[selected_core];
+    box(x, y, w, h);
+    char text[256];
+    if (h < 180) {
+        clip_text(x + 12, y + 24, w - 24, 12, foreground,
+                  "Enlarge window for core details / I: close");
+        return;
+    }
+    Color accent = c->online ? utilization_color(c->busy, palette.cpu) : muted;
+    color(accent);
+    rect(x, y, w, 3);
+    snprintf(text, sizeof text, "CPU %d / %s", selected_core, c->online ? "online" : "offline");
+    clip_text(x + 16, y + 32, w - 112, 16, accent, text);
+    button(x + w - 82, y + 10, 66, "Close", muted);
+    clip_text(x + 16, y + 60, w - 32, 11, muted, "Hardware and rates: latest displayed snapshot");
+    int cursor = history_cursor_valid
+                     ? history_nearest(snapshot->data.timestamps, HISTORY, view_head, view_samples,
+                                       history_cursor_time)
+                     : -1;
+    if (cursor >= 0 && view_cpu_history[cursor][selected_core + 1] >= 0)
+        snprintf(text, sizeof text, "Sample: %.1f%% / %.1fs ago%s",
+                 view_cpu_history[cursor][selected_core + 1],
+                 snapshot->data.timestamps[latest()] - snapshot->data.timestamps[cursor],
+                 history_pinned ? " / pinned" : "");
+    else
+        snprintf(text, sizeof text, "%s",
+                 history_pinned ? "Pinned sample outside retained data"
+                                : "Click a trace to pin a usage sample");
+    clip_text(x + 16, y + 80, w - 32, 11, cyan, text);
+    typedef struct {
+        const char *key;
+        char text[256];
+    } Row;
+    Row rows[24];
+    int count = 0;
+#define CORE_ROW(key_, ...)                                                                        \
+    do {                                                                                           \
+        rows[count].key = key_;                                                                    \
+        snprintf(rows[count].text, sizeof rows[count].text, __VA_ARGS__);                          \
+        count++;                                                                                   \
+    } while (0)
+    if (c->online) {
+        CORE_ROW("Busy", "%.1f%%", c->busy);
+        CORE_ROW("User / kernel", "%.1f%% / %.1f%%", c->user, c->system);
+        CORE_ROW("Idle / I/O wait", "%.1f%% / %.1f%%", fmax(0, 100 - c->busy - c->iowait),
+                 c->iowait);
+    } else {
+        CORE_ROW("Busy", "%s", "Unavailable / offline");
+        CORE_ROW("User / kernel", "%s", "Unavailable / offline");
+        CORE_ROW("Idle / I/O wait", "%s", "Unavailable / offline");
+    }
+    CORE_ROW("Physical core", "%s", core_id_text(c->core, text, sizeof text));
+    CORE_ROW("Socket / package", "%s", core_id_text(c->package, text, sizeof text));
+    CORE_ROW("Die", "%s", core_id_text(c->die, text, sizeof text));
+    CORE_ROW("Kernel core type", "%s", core_id_text(c->type, text, sizeof text));
+    CORE_ROW("Sibling CPU IDs", "%s", c->siblings[0] ? c->siblings : "Unavailable");
+    CORE_ROW("Reported clock", "%s", value(c->online ? c->mhz : -1, " MHz", text, sizeof text));
+    char minimum[48], maximum[48];
+    CORE_ROW("Hardware range", "%s / %s", value(c->min_mhz, " MHz", minimum, sizeof minimum),
+             value(c->max_mhz, " MHz", maximum, sizeof maximum));
+    CORE_ROW("Policy min / max", "%s / %s",
+             value(c->online ? c->policy_min_mhz : -1, " MHz", minimum, sizeof minimum),
+             value(c->online ? c->policy_max_mhz : -1, " MHz", maximum, sizeof maximum));
+    CORE_ROW("Base clock", "%s", value(c->base_mhz, " MHz", text, sizeof text));
+    CORE_ROW("Core sensor", "%s", value(c->online ? c->temperature : -1, " C", text, sizeof text));
+    CORE_ROW("Governor", "%s", c->online && c->governor[0] ? c->governor : "Unavailable");
+    CORE_ROW("Frequency driver", "%s",
+             c->online && c->frequency_driver[0] ? c->frequency_driver : "Unavailable");
+    CORE_ROW("L1 data / code", "%s / %s", c->l1_data[0] ? c->l1_data : "?",
+             c->l1_instruction[0] ? c->l1_instruction : "?");
+    CORE_ROW("L2 / L3 cache", "%s / %s", c->l2[0] ? c->l2 : "?", c->l3[0] ? c->l3 : "?");
+    CoreHistoryStats stats =
+        core_history_stats(&view_cpu_history[0][selected_core + 1], MAX_CPUS + 1,
+                           snapshot->data.timestamps, view_head, view_samples, history_window);
+    if (stats.count)
+        CORE_ROW("Window avg / peak", "%.1f%% / %.1f%%", stats.mean, stats.peak);
+    else
+        CORE_ROW("Window avg / peak", "%s", "Unavailable");
+    CORE_ROW("Measured samples", "%d / last %dm", stats.count, history_window / 60);
+#undef CORE_ROW
+    int room = h - 174, max_scroll = count * 30 - room;
+    if (max_scroll < 0)
+        max_scroll = 0;
+    if (core_info_scroll > max_scroll)
+        core_info_scroll = max_scroll;
+    if (core_info_scroll < 0)
+        core_info_scroll = 0;
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(x + 8, height - (y + 92 + room), w - 16, room);
+    for (int i = 0; i < count; i++)
+        info_tinted(x + 16, y + 112 + i * 30 - core_info_scroll, w - 32, rows[i].key, rows[i].text,
+                    i == 0 ? accent : foreground);
+    glDisable(GL_SCISSOR_TEST);
+    if (max_scroll > 0) {
+        float thumb = fmaxf(20, (float)room * room / (count * 30));
+        color(palette.cpu);
+        rect(x + w - 7, y + 92 + (room - thumb) * core_info_scroll / max_scroll, 3, thumb);
+    }
+    clip_text(x + 16, y + h - 64, w - 32, 10, muted,
+              "Wheel: details / caches and sensors may be shared");
+    button(x + 16, y + h - 48, 46, "<", cyan);
+    button(x + 70, y + h - 48, 46, ">", cyan);
+    button(x + 124, y + h - 48, w - 140, "CPU view", palette.cpu);
+}
+static void core_tooltip(void) {
+    if (tab != 0 || !core_hover.valid || drag || inspector_is_open() || confirm_fd >= 0)
+        return;
+    int w = 304, h = 54;
+    if (w > cpu_plot.w - 16)
+        w = cpu_plot.w - 16;
+    int x = core_pointer_x + 18, y = core_pointer_y - 66;
+    if (x + w > cpu_plot.x + cpu_plot.w - 8)
+        x = cpu_plot.x + cpu_plot.w - w - 8;
+    if (y < cpu_plot.y + 8)
+        y = core_pointer_y + 18;
+    if (y + h > cpu_plot.y + cpu_plot.h)
+        y = cpu_plot.y + cpu_plot.h - h;
+    box(x, y, w, h);
+    color(utilization_color(core_hover.value, palette.cpu));
+    rect(x, y, 3, h);
+    char text[160];
+    snprintf(text, sizeof text, "CPU %d / %.1f%% / %.1fs ago", core_hover.cpu, core_hover.value,
+             fmax(0, snapshot->data.timestamps[latest()] - core_hover.time));
+    clip_text(x + 12, y + 21, w - 24, 12, foreground, text);
+    clip_text(x + 12, y + 42, w - 24, 10, muted, "Click: details + pin / drag: orbit");
+}
+static void core_axis_label(double x, double y, double z, const char *text, int left, int offset) {
+    double point[3] = {x, y, z}, sx, sy, depth, eye;
+    if (!pick_project(&cpu_plot_projection, point, &sx, &sy, &depth, &eye))
+        return;
+    float tw = text_width(text, 10);
+    float xx = (float)sx - (left ? tw + 8 : tw / 2), yy = (float)sy + offset;
+    if (xx < cpu_plot.x + 8 || xx + tw > cpu_plot.x + cpu_plot.w - 8 || yy < cpu_plot.y + 10 ||
+        yy > cpu_plot.y + cpu_plot.h - 4)
+        return;
+    label(xx, yy, 10, muted, text);
 }
 static void draw_3d(int x, int y, int w, int h, int gpu_mode) {
     box(x, y, w, h);
     label(x + 16, y + 25, 13, muted,
-          gpu_mode ? "GPU ENGINE HISTORY / orbit with mouse" : "CPU HISTORY / orbit with mouse");
+          gpu_mode ? "GPU ENGINE HISTORY / orbit with mouse"
+                   : "CPU HISTORY / click a trace / I: details");
     int viewport_h = h - 65;
     if (viewport_h < 1)
         return;
@@ -601,6 +887,15 @@ static void draw_3d(int x, int y, int w, int h, int gpu_mode) {
     glTranslatef(0, -1, -zoom);
     glRotatef(pitch, 1, 0, 0);
     glRotatef(yaw, 0, 1, 0);
+    if (!gpu_mode) {
+        double model[16], projection[16];
+        int viewport[4];
+        glGetDoublev(GL_MODELVIEW_MATRIX, model);
+        glGetDoublev(GL_PROJECTION_MATRIX, projection);
+        glGetIntegerv(GL_VIEWPORT, viewport);
+        pick_frame_begin(&cpu_plot_projection, 0, 0, model, projection, viewport, height);
+        core_plot_begin(&cpu_plot, x, y + 35, w, viewport_h);
+    }
     color((Color){.13f, .19f, .25f});
     glBegin(GL_LINES);
     for (int i = 0; i <= 10; i++) {
@@ -617,33 +912,95 @@ static void draw_3d(int x, int y, int w, int h, int gpu_mode) {
         glVertex3f(8, i * 1.2f, -6);
     }
     glEnd();
+    /* The 95% boundary is visible even before history reaches it. */
+    color((Color){.65f, .18f, .23f});
+    glBegin(GL_LINE_LOOP);
+    glVertex3f(-8, 5.7f, -6);
+    glVertex3f(8, 5.7f, -6);
+    glVertex3f(8, 5.7f, 6);
+    glVertex3f(-8, 5.7f, 6);
+    glEnd();
     int shown = view_metrics.cpu_limit < 128 ? view_metrics.cpu_limit : 128;
     if (gpu_mode)
         shown = view_metrics.gpus[gpu_selected].engine_count;
     for (int c = 0; c < shown; c++) {
         if (!gpu_mode && !view_metrics.cpus[c].online)
             continue;
+        int connected = 0, has_point = 0;
+        double last_point[3] = {0};
+        float last_value = 0;
+        glLineWidth(!gpu_mode && c == selected_core && core_info_open ? 2.5f : 1);
         glBegin(GL_LINE_STRIP);
         for (int i = 0; i < view_samples; i++) {
             int idx = (view_head - view_samples + i + HISTORY) % HISTORY;
             float raw = gpu_mode ? view_metrics.gpus[gpu_selected].engines[c].history[idx]
                                  : view_cpu_history[idx][c + 1];
-            if (raw < 0)
+            if (raw < 0 || !isfinite(raw)) {
+                glEnd();
+                glBegin(GL_LINE_STRIP);
+                connected = 0;
                 continue;
+            }
             double age = snapshot->data.timestamps[latest()] - snapshot->data.timestamps[idx];
             if (age > history_window)
                 continue;
             float v = raw / 100;
-            glColor3f(.18f + .8f * v, .78f - .35f * v, .97f - .55f * v);
-            glVertex3f(shown > 1 ? -8 + 16.f * c / (shown - 1) : 0, v * 6,
-                       -6 + 12.f * (1 - (float)(age / history_window)));
+            color(utilization_color(raw, gpu_mode ? palette.gpu : palette.cpu));
+            double p[3] = {shown > 1 ? -8 + 16.f * c / (shown - 1) : 0, v * 6,
+                           -6 + 12.f * (1 - (float)(age / history_window))};
+            glVertex3dv(p);
+            memcpy(last_point, p, sizeof p);
+            last_value = raw;
+            has_point = 1;
+            if (!gpu_mode) {
+                double sx, sy, depth, eye;
+                if (pick_project(&cpu_plot_projection, p, &sx, &sy, &depth, &eye)) {
+                    core_plot_add(&cpu_plot,
+                                  (CorePlotPoint){sx, sy, depth, snapshot->data.timestamps[idx],
+                                                  raw, c, connected});
+                    connected = 1;
+                } else
+                    connected = 0;
+            }
         }
         glEnd();
+        if (has_point) {
+            color(utilization_color(last_value, gpu_mode ? palette.gpu : palette.cpu));
+            glPointSize(!gpu_mode && c == selected_core && core_info_open ? 7 : 4);
+            glBegin(GL_POINTS);
+            glVertex3dv(last_point);
+            glEnd();
+        }
     }
+    glPointSize(1);
+    glLineWidth(1);
     overlay();
+    if (!gpu_mode) {
+        char text[64];
+        int step = (shown + 11) / 12;
+        if (step < 1)
+            step = 1;
+        for (int c = 0; c < shown; c += step) {
+            snprintf(text, sizeof text, "CPU %d", c);
+            core_axis_label(shown > 1 ? -8 + 16.0 * c / (shown - 1) : 0, 0, 6, text, 0, 16);
+        }
+        for (int percent = 0; percent <= 100; percent += 25) {
+            snprintf(text, sizeof text, "%d%%", percent);
+            core_axis_label(-8, percent * .06, -6, text, 1, 4);
+        }
+        for (int t = 0; t < 3; t++) {
+            if (t == 2)
+                snprintf(text, sizeof text, "now");
+            else
+                snprintf(text, sizeof text, "-%ds", history_window * (2 - t) / 2);
+            core_axis_label(-8, 0, -6 + 6 * t, text, 1, 32);
+        }
+    }
+    if (!gpu_mode && core_pointer_valid && !drag)
+        core_hover = core_plot_pick(&cpu_plot, core_pointer_x, core_pointer_y, 8);
     label(x + 16, y + h - 12, 11, muted,
-          gpu_mode ? "X engine   Y engine usage %   Z time"
-                   : "X logical CPU (first 128)   Y usage %   Z time");
+          gpu_mode ? "X engine / Y usage / Z time / red >=95%"
+                   : "X CPU (first 128) / Y usage / Z time / red >=95%");
 }
 static void overview(void) {
     int gap = 16, cols = width < 900 ? 2 : 4, w = (width - 48 - (cols - 1) * gap) / cols, y = 136;
@@ -663,28 +1020,39 @@ static void overview(void) {
              view_metrics.gpu_count == 1 ? "" : "s");
     snprintf(values[3], 128, "%.2f MiB/s", (view_rxrate + view_txrate) / 1048576);
     snprintf(details[3], 128, "RX %.2f / TX %.2f", view_rxrate / 1048576, view_txrate / 1048576);
-    Color colors[] = {cyan, purple, green, orange};
+    Color colors[] = {palette.cpu, palette.ram, palette.gpu, palette.network};
+    HealthLevel levels[] = {view_health.cpu, view_health.memory, view_health.gpu, HEALTH_NORMAL};
     for (int i = 0; i < 4; i++) {
         int x = 24 + (i % cols) * (w + gap), yy = y + (i / cols) * 102;
         box(x, yy, w, cols == 2 ? 90 : 112);
+        Color accent = health_color(levels[i], colors[i]);
+        color(accent);
+        rect(x, yy, w, 3);
         label(x + 16, yy + 21, 11, muted, titles[i]);
-        clip_text(x + 16, yy + 52, w - 32, width < 1100 ? 22 : 29, colors[i], values[i]);
+        clip_text(x + 16, yy + 52, w - 32, width < 1100 ? 22 : 29, accent, values[i]);
         clip_text(x + 16, yy + (cols == 2 ? 76 : 92), w - 32, 11, muted, details[i]);
     }
     if (cols == 2) {
-        draw_3d(24, 344, width - 48, height - 382, 0);
+        if (core_info_open)
+            core_details();
+        else
+            draw_3d(24, 344, width - 48, height - 382, 0);
         return;
     }
     int left = split_left(overview_ratio), right = width - 64 - left, body_h = height - 302;
     draw_3d(24, 264, left, body_h, 0);
+    if (core_info_open) {
+        core_details();
+        return;
+    }
     int x = 40 + left, h = (body_h - 16) / 2;
     char s[128];
     snprintf(s, sizeof s, "RAM / %.1f%% / SWAP %.1f%%", view_memory, view_swap);
-    chart(x, 264, right, h, s, view_mem_history, 1, 100, purple);
+    chart(x, 264, right, h, s, view_mem_history, 1, 100, palette.ram, HEALTH_UTILIZATION);
     snprintf(s, sizeof s, "DISK / R %.1f W %.1f MiB/s", view_readrate / 1048576,
              view_writerate / 1048576);
     chart(x, 280 + h, right, body_h - h - 16, s, view_disk_history, 1, peak(view_disk_history),
-          orange);
+          palette.disk, HEALTH_NONE);
 }
 static int pressure_scroll;
 static void pressure_view(void) {
@@ -706,7 +1074,7 @@ static void pressure_view(void) {
         pressure_scroll = 0;
     const char *names[] = {"CPU / runnable tasks waiting", "MEMORY / allocation stalls",
                            "I/O / storage stalls"};
-    Color colors[] = {cyan, purple, orange};
+    Color colors[] = {palette.cpu, palette.ram, palette.disk};
     glEnable(GL_SCISSOR_TEST);
     glScissor(0, 34, width, height - 236 > 0 ? height - 236 : 1);
     for (int i = 0; i < 3; i++) {
@@ -715,12 +1083,18 @@ static void pressure_view(void) {
             y = 202 + (i / columns) * (card_h + 16) - pressure_scroll;
         char s[160];
         box(x, y, w, card_h);
+        Color pressure_color = health_color(view_health.pressure[i], colors[i]);
+        color(pressure_color);
+        rect(x, y, w, 3);
         clip_text(x + 16, y + 26, w - 32, 12, muted, names[i]);
         if (p->available)
             snprintf(s, sizeof s, "%.2f%%", p->avg10);
         else
             snprintf(s, sizeof s, "Unavailable");
-        label(x + 16, y + 67, 28, colors[i], s);
+        label(x + 16, y + 67, 28,
+              p->available ? health_color(health_classify(p->avg10, HEALTH_PRESSURE), colors[i])
+                           : muted,
+              s);
         label(x + 16, y + 89, 11, muted, "average waiting over the last 10 seconds");
         if (p->available)
             snprintf(s, sizeof s, "60s %.2f%%   /   300s %.2f%%", p->avg60, p->avg300);
@@ -734,9 +1108,13 @@ static void pressure_view(void) {
                      i == 0   ? "cpu"
                      : i == 1 ? "memory"
                               : "io");
-        clip_text(x + 16, y + 142, w - 32, 11, muted, s);
+        clip_text(x + 16, y + 142, w - 32, 11,
+                  i > 0 && p->full_available
+                      ? health_color(health_classify(p->full10, HEALTH_FULL_PRESSURE), colors[i])
+                      : muted,
+                  s);
         chart(x + 8, y + 158, w - 16, card_h - 166, "WAITING / EACH SAMPLE (%)", p->history, 1, 100,
-              colors[i]);
+              colors[i], HEALTH_PRESSURE);
     }
     glDisable(GL_SCISSOR_TEST);
 }
@@ -753,6 +1131,7 @@ static int cpu_page(void) {
 }
 static void cpu_view(void) {
     clip_text(24, 145, width - 300, 20, foreground, view_metrics.cpu_name);
+    button(width - 210, 126, 186, "Core details / I", palette.cpu);
     char s[256], temp[64];
     snprintf(s, sizeof s, "%d physical / %d logical / %d socket(s)  |  governor %s  |  package %s",
              view_metrics.physical_cores, view_metrics.cpu_count, view_metrics.packages,
@@ -777,6 +1156,9 @@ static void cpu_view(void) {
             const CpuInfo *c = &view_metrics.cpus[id];
             int x = 24 + col * (w + 12), y = 250 + row * 134;
             box(x, y, w, 122);
+            Color accent = c->online ? utilization_color(c->busy, palette.cpu) : muted;
+            color(accent);
+            rect(x, y, w, 2);
             if (id == selected_core) {
                 color(cyan);
                 rect(x, y, 3, 122);
@@ -784,7 +1166,7 @@ static void cpu_view(void) {
             snprintf(s, sizeof s, "CPU %02d %s", id, c->online ? "" : " / offline");
             label(x + 14, y + 23, 13, foreground, s);
             snprintf(s, sizeof s, "%.1f%%", c->busy);
-            label(x + w - 88, y + 24, 18, cyan, s);
+            label(x + w - 88, y + 24, 18, accent, s);
             char freq[48], t[48];
             snprintf(s, sizeof s, "%s  /  %s", value(c->mhz, " MHz", freq, sizeof freq),
                      value(c->temperature, " C", t, sizeof t));
@@ -792,14 +1174,20 @@ static void cpu_view(void) {
             snprintf(s, sizeof s, "Core %d  socket %d  max %.0f MHz", c->core, c->package,
                      c->max_mhz);
             clip_text(x + 14, y + 66, w - 28, 11, muted, s);
-            bar(x + 14, y + 74, w - 28, c->busy, c->busy > 85 ? orange : cyan);
-            color(cyan);
+            bar(x + 14, y + 74, w - 28, c->online ? c->busy : -1, palette.cpu);
             glBegin(GL_LINE_STRIP);
             for (int i = 0; i < view_samples; i++) {
                 int idx = (view_head - view_samples + i + HISTORY) % HISTORY;
                 double age = snapshot->data.timestamps[latest()] - snapshot->data.timestamps[idx];
                 if (age > history_window)
                     continue;
+                float busy = view_cpu_history[idx][id + 1];
+                if (!isfinite(busy) || busy < 0) {
+                    glEnd();
+                    glBegin(GL_LINE_STRIP);
+                    continue;
+                }
+                color(utilization_color(busy, palette.cpu));
                 glVertex2f(x + 14 + (w - 28) * (1 - age / history_window),
                            y + 113 - 27 * view_cpu_history[idx][id + 1] / 100);
             }
@@ -884,7 +1272,7 @@ static void gpu_view(void) {
     if (gpu_3d)
         draw_3d(24, graph_y, left, gh, 1);
     else
-        chart(24, graph_y, left, gh, s, g->history, 1, 100, green);
+        chart(24, graph_y, left, gh, s, g->history, 1, 100, palette.gpu, HEALTH_UTILIZATION);
     int by = graph_y + gh + 16;
     box(24, by, left, engine_h);
     clip_text(40, by + 25, left - 32, 12, muted, "ENGINE ACTIVITY / capacity normalized");
@@ -893,8 +1281,9 @@ static void gpu_view(void) {
         const Engine *e = &g->engines[i];
         snprintf(s, sizeof s, "%-17s x%u", e->name, e->capacity);
         label(40, ey, 13, foreground, s);
-        label(24 + left - 100, ey, 13, green, value(e->busy, "%", v, sizeof v));
-        bar(40, ey + 10, left - 32, e->busy, green);
+        label(24 + left - 100, ey, 13, utilization_color(e->busy, palette.gpu),
+              value(e->busy, "%", v, sizeof v));
+        bar(40, ey + 10, left - 32, e->busy, palette.gpu);
         ey += 36;
     }
     if (!g->engine_count)
@@ -920,7 +1309,10 @@ static void gpu_view(void) {
         snprintf(s, sizeof s, "%.0f / %.0f MiB", g->vram_used / 1048576, g->vram_total / 1048576);
     else
         snprintf(s, sizeof s, "Shared / not exposed");
-    GPU_INFO("Dedicated VRAM", s);
+    double vram_percent =
+        g->vram_total > 0 && g->vram_used >= 0 ? 100.0 * g->vram_used / g->vram_total : -1;
+    info_tinted(x + 16, yy, ww, "Dedicated VRAM", s, utilization_color(vram_percent, palette.ram));
+    yy += 30;
     if (g->gtt_total >= 0)
         snprintf(s, sizeof s, "%.0f / %.0f MiB", g->gtt_used / 1048576, g->gtt_total / 1048576);
     else
@@ -1372,7 +1764,8 @@ static void ram_view(void) {
     int xx = 56 + w;
     label(xx, 220, 12, muted, "CAPACITY");
     snprintf(s, sizeof s, "%.1f / %.1f GiB used", view_memory * view_memtotal / 100, view_memtotal);
-    clip_text(xx, 249, w - 32, width < 700 ? 14 : 18, purple, s);
+    clip_text(xx, 249, w - 32, width < 700 ? 14 : 18, utilization_color(view_memory, palette.ram),
+              s);
     snprintf(s, sizeof s, "Available %.0f / free %.0f MiB", m->available / 1024., m->free / 1024.);
     clip_text(xx, 276, w - 32, 12, muted, s);
     snprintf(s, sizeof s, "Swap %.0f / %.0f MiB", (m->swap_total - m->swap_free) / 1024.,
@@ -1380,7 +1773,7 @@ static void ram_view(void) {
     clip_text(xx, 303, w - 32, 12, muted, s);
     if (height >= 650)
         chart(24, 334, width - 48, 106, "RESIDENT MEMORY / SYSTEM (%)", view_mem_history, 1, 100,
-              purple);
+              palette.ram, HEALTH_UTILIZATION);
     label(24, ram_table_top() - 34, 11, muted,
           "Counters overlap. RSS per process includes shared pages.");
     label(32, ram_table_top() - 11, 11, muted, "PID");
@@ -1397,7 +1790,7 @@ static void ram_view(void) {
         snprintf(s, sizeof s, "%d", p->pid);
         label(32, yy + 17, 12, foreground, s);
         snprintf(s, sizeof s, "%.1f", p->rss_kib / 1024.);
-        label(120, yy + 17, 12, purple, s);
+        label(120, yy + 17, 12, utilization_color(process_memory_percent(p), palette.ram), s);
         clip_text(230, yy + 17, width - 262, 12, foreground, p->name);
     }
 }
@@ -1464,13 +1857,14 @@ static void inspector_view(void) {
             peak_range(values, inspector.write_index, inspector.history_count, inspector.time);
         float maximum = inspector.metric == 0 ? fmaxf(100, visible_peak) : visible_peak;
         chart_history(x + 12, y + 178, w - 24, h - 286, s, values, 1, maximum,
-                      inspector.metric == 0   ? cyan
-                      : inspector.metric == 1 ? purple
-                                              : orange,
+                      inspector.metric == 0   ? palette.cpu
+                      : inspector.metric == 1 ? palette.ram
+                                              : palette.disk,
                       inspector.write_index, inspector.history_count, inspector.time,
                       inspector.metric == 0   ? "%"
                       : inspector.metric == 1 ? "MiB"
-                                              : "KiB/s");
+                                              : "KiB/s",
+                      HEALTH_NONE);
     }
     clip_text(x + 20, y + h - 83, w - 40, 11, muted,
               inspector.metric >= 3
@@ -1538,9 +1932,9 @@ static void process_view(void) {
         }
         clip_text(col[2] + 8, y + 19, col[3] - col[2] - 16, 13, foreground, p->name);
         snprintf(s, sizeof s, "%.1f", p->cpu);
-        label(col[3] + 8, y + 19, 13, p->cpu > 50 ? orange : cyan, s);
+        label(col[3] + 8, y + 19, 13, utilization_color(process_capacity(p->cpu), palette.cpu), s);
         snprintf(s, sizeof s, "%.1f", p->rss_kib / 1024.);
-        label(col[4] + 8, y + 19, 13, foreground, s);
+        label(col[4] + 8, y + 19, 13, utilization_color(process_memory_percent(p), palette.ram), s);
         if (width >= 900) {
             snprintf(s, sizeof s, "%d", p->threads);
             label(col[5] + 8, y + 19, 13, muted, s);
@@ -1996,7 +2390,8 @@ static Color topology_color(int i) {
         return m->error ? red : m->symlink ? orange : m->directory ? cyan : purple;
     if (!m->selectable)
         return muted;
-    return m->cpu > 50 ? red : m->uid == getuid() ? cyan : purple;
+    return utilization_color(process_capacity(m->cpu),
+                             m->uid == getuid() ? palette.cpu : palette.ram);
 }
 static const char *topology_node_name(int i, char *out, size_t size) {
     snprintf(out, size, "%s", scene_meta[i].label);
@@ -2619,6 +3014,15 @@ static void topology_layout_undo(void) {
 static void topology_passive(int x, int y) {
     if (confirm_fd < 0)
         history_hover(x, y);
+    core_pointer_x = x;
+    core_pointer_y = y;
+    core_pointer_valid = tab == 0 && !inspector.open && confirm_fd < 0;
+    core_hover =
+        core_pointer_valid && !drag ? core_plot_pick(&cpu_plot, x, y, 8) : (CorePlotHit){0};
+    if (core_hover.valid && !history_pinned) {
+        history_cursor_time = core_hover.time;
+        history_cursor_valid = 1;
+    }
     if ((tab == 6 || tab == 7) && !tree_gesture.active && !inspector.open && confirm_fd < 0) {
         int hit = topology_pick(x, y);
         if (hit != tree_hover) {
@@ -2637,6 +3041,12 @@ static int editor_phase;
 static int advanced_phase;
 static int manual_phase;
 static void manual_smoke_before(void);
+static int color_phase, color_saved_paused, color_saved_palette, color_saved_window;
+static void color_smoke_before(void);
+static int core_phase, core_saved_width, core_saved_height;
+static void core_smoke_before(void);
+static void reset_camera(void);
+static void reshape(int w, int h);
 static void special(int k, int x, int y);
 static int smoke_actions(void) {
     int ok = 1;
@@ -3025,8 +3435,12 @@ static void smoke_step(void) {
             advanced_smoke_before();
         else if (editor_phase < 12)
             editor_smoke_before();
-        else
+        else if (manual_phase < 4)
             manual_smoke_before();
+        else if (color_phase < 6)
+            color_smoke_before();
+        else
+            core_smoke_before();
     }
 }
 static void advanced_smoke_before(void) {
@@ -3512,6 +3926,275 @@ static void manual_smoke_before(void) {
             ui_failed ? "FAIL" : "PASS");
     }
 }
+static void color_fixture_values(float cpu, double memory) {
+    double now = seconds();
+    color_fixture->data.history_head = 60;
+    color_fixture->data.history_count = 60;
+    color_fixture->data.memory_percent = memory;
+    color_fixture->data.load_average[0] = color_fixture->hardware.cpu_count * .5;
+    for (int i = 0; i < 60; i++) {
+        float fraction = (float)i / 59;
+        color_fixture->data.timestamps[i] = now - 59 + i;
+        color_fixture->data.cpu_history[i][0] = cpu * (.6f + .4f * fraction);
+        color_fixture->data.mem_history[i] = (float)(memory * (.8 + .2 * fraction));
+        for (int core = 0; core < color_fixture->hardware.cpu_limit; core++)
+            color_fixture->data.cpu_history[i][core + 1] = cpu;
+    }
+    for (int i = 0; i < color_fixture->hardware.gpu_count; i++) {
+        Gpu *gpu = &color_fixture->hardware.gpus[i];
+        gpu->busy = cpu;
+        if (gpu->vram_total > 0)
+            gpu->vram_used = gpu->vram_total * .3;
+        for (int j = 0; j < 60; j++)
+            gpu->history[j] = cpu;
+    }
+    for (int i = 0; i < 3; i++) {
+        Pressure *p = &color_fixture->data.pressure[i];
+        p->avg10 = p->avg60 = p->avg300 = p->full10 = 0;
+        p->available = 1;
+        p->full_available = i > 0;
+        for (int j = 0; j < 60; j++)
+            p->history[j] = 0;
+    }
+}
+static void color_smoke_before(void) {
+    if (color_phase == 0) {
+        color_fixture = malloc(sizeof *color_fixture);
+        if (!color_fixture) {
+            ui_failed = 1;
+            color_phase = 6;
+            return;
+        }
+        memcpy(color_fixture, snapshot, sizeof *color_fixture);
+        color_saved_paused = paused;
+        color_saved_palette = palette_index;
+        color_saved_window = history_window;
+        paused = 1;
+        history_window = 60;
+        palette_index = 0;
+        snapshot = color_fixture;
+        tab = 0;
+        color_fixture_values(42, 55);
+        color_phase = 1;
+        return;
+    }
+    if (color_phase == 1) {
+        if (view_health.level != HEALTH_NORMAL)
+            ui_failed = 1;
+        keyboard('p', 0, 0);
+        if (palette_index != 1)
+            ui_failed = 1;
+        color_fixture_values(90, 89);
+        color_phase = 2;
+        return;
+    }
+    if (color_phase == 2) {
+        if (view_health.level != HEALTH_WARNING)
+            ui_failed = 1;
+        if (width > 640) {
+            mouse(GLUT_LEFT_BUTTON, GLUT_DOWN, 180, 25);
+            mouse(GLUT_LEFT_BUTTON, GLUT_UP, 180, 25);
+        } else
+            keyboard('p', 0, 0);
+        if (palette_index != 2)
+            ui_failed = 1;
+        color_fixture_values(98, 97);
+        color_phase = 3;
+        return;
+    }
+    if (color_phase == 3) {
+        if (view_health.level != HEALTH_DANGER || view_health.overloaded)
+            ui_failed = 1;
+        Color c = utilization_color(98, palette.cpu);
+        if (memcmp(&c, &red, sizeof c))
+            ui_failed = 1;
+        keyboard('p', 0, 0);
+        if (palette_index)
+            ui_failed = 1;
+        color_fixture->data.load_average[0] = color_fixture->hardware.cpu_count * 2;
+        Pressure *p = &color_fixture->data.pressure[1];
+        p->avg10 = 35;
+        p->full10 = 18;
+        for (int i = 0; i < 60; i++)
+            p->history[i] = (float)(10 + i * 25.0 / 59);
+        keyboard('5', 0, 0);
+        color_phase = 4;
+        return;
+    }
+    if (color_phase == 4) {
+        if (!view_health.overloaded || view_health.pressure[1] != HEALTH_DANGER)
+            ui_failed = 1;
+        keyboard('1', 0, 0);
+        color_phase = 5;
+        return;
+    }
+    if (color_phase == 5) {
+        snapshot = sampler_poll();
+        free(color_fixture);
+        color_fixture = NULL;
+        paused = color_saved_paused;
+        palette_index = color_saved_palette;
+        history_window = color_saved_window;
+        color_phase = 6;
+        printf("%s: palette keyboard/button cycling and normal/warning/danger/overload rendering "
+               "with labeled synthetic data\n",
+               ui_failed ? "FAIL" : "PASS");
+    }
+}
+static int core_test_point(int *x, int *y, CorePlotHit *hit) {
+    for (int i = cpu_plot.count - 1; i >= 0; i--) {
+        const CorePlotPoint *point = &cpu_plot.points[i];
+        *x = (int)lround(point->x);
+        *y = (int)lround(point->y);
+        *hit = core_plot_pick(&cpu_plot, *x, *y, 8);
+        if (hit->valid)
+            return 1;
+    }
+    return 0;
+}
+static void core_smoke_before(void) {
+    if (frames > 500 && core_phase < 9) {
+        puts("FAIL: core graph tests timed out waiting for a usable window");
+        ui_failed = 1;
+        core_phase = 9;
+        return;
+    }
+    if (core_phase == 0) {
+        inspector_close();
+        paused = core_info_open = 0;
+        tab = 0;
+        history_clear();
+        reset_camera();
+        glutFullScreen();
+        core_phase = 1;
+        return;
+    }
+    if (core_phase == 1) {
+        if (width < 1000 || height < 720)
+            return;
+        int x, y;
+        CorePlotHit expected;
+        if (!core_test_point(&x, &y, &expected))
+            return;
+        topology_passive(x, y);
+        if (!core_hover.valid || core_hover.cpu != expected.cpu ||
+            core_hover.time != expected.time || core_hover.value != expected.value ||
+            !history_cursor_valid)
+            ui_failed = 1;
+        float old_yaw = yaw, old_pitch = pitch;
+        /* A collector publication between drawing and press must not change
+           the core/sample captured from the geometry the user actually saw. */
+        if (!sample())
+            ui_failed = 1;
+        mouse(GLUT_LEFT_BUTTON, GLUT_DOWN, x, y);
+        const Snapshot *held = snapshot;
+        poll_views();
+        if (!plot_press || snapshot != held)
+            ui_failed = 1;
+        motion(x + 1, y + 1);
+        mouse(GLUT_LEFT_BUTTON, GLUT_UP, x + 1, y + 1);
+        if (!core_info_open || selected_core != expected.cpu || !history_pinned ||
+            history_cursor_time != expected.time || yaw != old_yaw || pitch != old_pitch)
+            ui_failed = 1;
+        core_phase = 2;
+        return;
+    }
+    if (core_phase == 2) {
+        int x, y, w, h;
+        if (!core_panel_geometry(&x, &y, &w, &h)) {
+            ui_failed = 1;
+            core_phase = 9;
+            return;
+        }
+        int old = selected_core;
+        mouse(GLUT_LEFT_BUTTON, GLUT_DOWN, x + 90, y + h - 30);
+        mouse(GLUT_LEFT_BUTTON, GLUT_UP, x + 90, y + h - 30);
+        if (view_metrics.cpu_count > 1 && selected_core == old)
+            ui_failed = 1;
+        mouse(4, GLUT_DOWN, x + 40, y + 140);
+        if (core_info_scroll <= 0)
+            ui_failed = 1;
+        core_phase = 3;
+        return;
+    }
+    if (core_phase == 3) {
+        int old = selected_core;
+        keyboard('2', 0, 0);
+        keyboard('i', 0, 0);
+        if (tab != 0 || !core_info_open || selected_core != old)
+            ui_failed = 1;
+        keyboard(27, 0, 0);
+        if (core_info_open)
+            ui_failed = 1;
+        keyboard('i', 0, 0);
+        core_info_scroll = 10000;
+        core_phase = 4;
+        return;
+    }
+    if (core_phase == 4) {
+        int x, y;
+        CorePlotHit hit;
+        if (!core_test_point(&x, &y, &hit))
+            return;
+        int old = selected_core;
+        float old_yaw = yaw, old_pitch = pitch;
+        mouse(GLUT_LEFT_BUTTON, GLUT_DOWN, x, y);
+        motion(x + 20, y + 14);
+        mouse(GLUT_LEFT_BUTTON, GLUT_UP, x + 20, y + 14);
+        if (plot_press || selected_core != old || (yaw == old_yaw && pitch == old_pitch))
+            ui_failed = 1;
+        old_yaw = yaw;
+        old_pitch = pitch;
+        mouse(GLUT_LEFT_BUTTON, GLUT_DOWN, x, y);
+        motion(x + 18, y + 12);
+        keyboard(27, 0, 0);
+        if (plot_press || drag || yaw != old_yaw || pitch != old_pitch || !core_info_open)
+            ui_failed = 1;
+        core_phase = 5;
+        return;
+    }
+    if (core_phase == 5) {
+        keyboard('c', 0, 0);
+        keyboard('2', 0, 0);
+        for (int i = view_metrics.cpu_limit - 1; i >= 0; i--)
+            if (view_metrics.cpus[i].online) {
+                selected_core = i;
+                break;
+            }
+        keyboard('i', 0, 0);
+        if (!core_info_open || tab != 0)
+            ui_failed = 1;
+        core_phase = 6;
+        return;
+    }
+    if (core_phase == 6) {
+        core_saved_width = width;
+        core_saved_height = height;
+        /* Render a real narrow viewport without depending on whether the
+           desktop window manager honors client resize requests. */
+        reshape(720, 900);
+        core_info_scroll = 0;
+        core_phase = 7;
+        return;
+    }
+    if (core_phase == 7) {
+        if (cpu_plot.valid || !core_info_open || width != 720)
+            ui_failed = 1;
+        special(GLUT_KEY_PAGE_DOWN, 0, 0);
+        if (core_info_scroll <= 0)
+            ui_failed = 1;
+        core_phase = 8;
+        return;
+    }
+    if (core_phase == 8) {
+        reshape(core_saved_width, core_saved_height);
+        keyboard('i', 0, 0);
+        core_phase = 9;
+        printf("%s: CPU trace hover/pick, sample capture across publication, jitter, details, "
+               "core navigation, scrolling, orbit, cancel and narrow viewport\n",
+               ui_failed ? "FAIL" : "PASS");
+    }
+}
 static void capture_frame(void) {
     const char *directory = getenv("LSM_CAPTURE_DIR");
     if (!directory || !smoke)
@@ -3531,7 +4214,11 @@ static void capture_frame(void) {
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
     glReadPixels(0, 0, width, height, GL_RGB, GL_UNSIGNED_BYTE, pixels);
     char path[4096];
-    if (manual_phase)
+    if (core_phase)
+        snprintf(path, sizeof path, "%s/lsm-core-%d.ppm", directory, core_phase);
+    else if (color_fixture)
+        snprintf(path, sizeof path, "%s/lsm-color-%d.ppm", directory, color_phase);
+    else if (manual_phase)
         snprintf(path, sizeof path, "%s/lsm-manual-%d.ppm", directory, manual_phase);
     else if (editor_phase >= 1)
         snprintf(path, sizeof path, "%s/lsm-editor-%d.ppm", directory, editor_phase);
@@ -3551,6 +4238,7 @@ static void capture_frame(void) {
 static void display(void) {
     if (smoke)
         smoke_step();
+    health_evaluate(snapshot, &view_health);
     glClearColor(.025f, .035f, .055f, 1);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     overlay();
@@ -3558,6 +4246,8 @@ static void display(void) {
     chart_hit_tab = tab;
     chart_hit_sequence = snapshot->sequence;
     chart_hit_modal = inspector.open;
+    cpu_plot.valid = 0;
+    core_hover.valid = 0;
     header();
     if (width < 400 || height < 440) {
         clip_text(16, 155, width - 32, 12, foreground, "Enlarge window or press F for fullscreen");
@@ -3591,6 +4281,7 @@ static void display(void) {
             manual_view();
             break;
         }
+    core_tooltip();
     const char *help = tab == 3 ? "Click headers: sort  |  /: search  |  Wheel: scroll  |  T: end  "
                                   "K: kill | I: inspect | Space: freeze"
                                 : "1-9: views | F: fullscreen | Drag: orbit | Wheel: scroll / zoom "
@@ -3638,14 +4329,14 @@ static void display(void) {
     }
     glutSwapBuffers();
     if (smoke && ++frames >= 42 && advanced_phase >= 10 && editor_phase >= 12 &&
-        manual_phase >= 4) {
+        manual_phase >= 4 && color_phase >= 6 && core_phase >= 9) {
         printf("%s: all views, 3D graphs, process filter, selection dialog and resize rendering\n",
                ui_failed ? "FAIL" : "PASS");
         glutLeaveMainLoop();
     }
 }
 static void poll_views(void) {
-    if (!paused && !tree_gesture.active) {
+    if (!paused && !tree_gesture.active && !plot_press) {
         snapshot = sampler_poll();
         if (files_running)
             file_frame = files_poll();
@@ -3662,6 +4353,13 @@ static void reshape(int w, int h) {
     topology_gesture_cancel();
     presented.valid = 0;
     panel_drag = 0;
+    if (plot_press) {
+        yaw = plot_press_yaw;
+        pitch = plot_press_pitch;
+    }
+    plot_press = drag = 0;
+    cpu_plot.valid = 0;
+    core_hover.valid = 0;
     layout_revision++;
     width = w > 0 ? w : 1;
     height = h > 0 ? h : 1;
@@ -3685,6 +4383,13 @@ static void keyboard(unsigned char k, int x, int y) {
     if (tree_gesture.active) {
         if (k == 27 || k == 26)
             topology_gesture_cancel();
+        return;
+    }
+    if (plot_press && k == 27) {
+        yaw = plot_press_yaw;
+        pitch = plot_press_pitch;
+        plot_press = drag = 0;
+        glutPostRedisplay();
         return;
     }
     if (inspector.open) {
@@ -3763,6 +4468,26 @@ static void keyboard(unsigned char k, int x, int y) {
         history_window = history_next_window(history_window);
     if (k == 'c' || k == 'C')
         history_clear();
+    if (k == 'p' || k == 'P')
+        cycle_palette();
+    if ((k == 'i' || k == 'I') && (tab == 0 || tab == 1)) {
+        core_info_open = tab == 1 ? 1 : !core_info_open;
+        tab = 0;
+        core_info_scroll = 0;
+        cpu_plot.valid = 0;
+        core_hover.valid = 0;
+    }
+    if (tab == 0 && core_info_open) {
+        if (k == '[')
+            core_step(-1);
+        if (k == ']')
+            core_step(1);
+        if (k == 27) {
+            core_info_open = 0;
+            glutPostRedisplay();
+            return;
+        }
+    }
     if (k >= '1' && k <= '9') {
         tab = k - '1';
         search_focus = 0;
@@ -3906,6 +4631,22 @@ static void special(int k, int x, int y) {
     (void)y;
     if (confirm_fd >= 0 || search_focus || inspector.open || tree_gesture.active)
         return;
+    if (tab == 0 && core_info_open) {
+        if (k == GLUT_KEY_UP)
+            core_info_scroll -= 30;
+        if (k == GLUT_KEY_DOWN)
+            core_info_scroll += 30;
+        if (k == GLUT_KEY_PAGE_UP)
+            core_info_scroll -= 180;
+        if (k == GLUT_KEY_PAGE_DOWN)
+            core_info_scroll += 180;
+        if (k == GLUT_KEY_LEFT)
+            core_step(-1);
+        if (k == GLUT_KEY_RIGHT)
+            core_step(1);
+        glutPostRedisplay();
+        return;
+    }
     if (tab == MANUAL_VIEW) {
         if (k == GLUT_KEY_PAGE_DOWN)
             manual_scroll += height > 296 ? height - 276 : 22;
@@ -3941,6 +4682,17 @@ static void mouse(int b, int state, int x, int y) {
             panel_drag = 0;
             glutPostRedisplay();
             return;
+        }
+        if (b == GLUT_LEFT_BUTTON && plot_press) {
+            if (!plot_moved && !gesture_moved(plot_press_x, plot_press_y, x, y) &&
+                plot_press_hit.valid && tab == 0) {
+                selected_core = plot_press_hit.cpu;
+                core_info_open = 1;
+                core_info_scroll = 0;
+                history_cursor_time = plot_press_hit.time;
+                history_pinned = history_cursor_valid = 1;
+            }
+            plot_press = 0;
         }
         if (topology_tab())
             topology_release(b, x, y);
@@ -4029,6 +4781,11 @@ static void mouse(int b, int state, int x, int y) {
     if (tree_gesture.active)
         return;
     if (b == 3 || b == 4) {
+        int xx, yy, ww, hh;
+        if (core_panel_geometry(&xx, &yy, &ww, &hh) && inside(x, y, xx, yy, ww, hh)) {
+            core_info_scroll += b == 3 ? -60 : 60;
+            return;
+        }
         scroll(b == 3 ? -1 : 1);
         return;
     }
@@ -4039,6 +4796,10 @@ static void mouse(int b, int state, int x, int y) {
     }
     if (inside(x, y, width - 288, 12, 144, 34)) {
         history_window = history_next_window(history_window);
+        return;
+    }
+    if (width > 640 && inside(x, y, 166, 12, 170, 34)) {
+        cycle_palette();
         return;
     }
     if (history_click(x, y))
@@ -4062,6 +4823,19 @@ static void mouse(int b, int state, int x, int y) {
     }
     if (width < 400 || height < 440)
         return;
+    if (core_panel_click(x, y))
+        return;
+    if (tab == 0 && cpu_plot.valid &&
+        inside(x, y, cpu_plot.x, cpu_plot.y, cpu_plot.w, cpu_plot.h)) {
+        plot_press_hit = core_plot_pick(&cpu_plot, x, y, 8);
+        plot_press = drag = 1;
+        plot_moved = 0;
+        mx = plot_press_x = x;
+        my = plot_press_y = y;
+        plot_press_yaw = yaw;
+        plot_press_pitch = pitch;
+        return;
+    }
     if (topology_tab()) {
         topology_click(x, y);
         return;
@@ -4080,6 +4854,10 @@ static void mouse(int b, int state, int x, int y) {
         return;
     }
     if (tab == 1) {
+        if (inside(x, y, width - 210, 126, 186, 34)) {
+            keyboard('i', x, y);
+            return;
+        }
         int cols = cpu_columns(), w = (width - 48 - 12 * (cols - 1)) / cols;
         if (x >= 24 && x < width - 24 && y >= 250 && y < 250 + cpu_rows() * 134) {
             int col = (x - 24) / (w + 12), row = (y - 250) / 134,
@@ -4158,6 +4936,11 @@ static void motion(int x, int y) {
         return;
     }
     if (drag) {
+        if (plot_press && !plot_moved) {
+            if (!gesture_moved(plot_press_x, plot_press_y, x, y))
+                return;
+            plot_moved = 1;
+        }
         yaw += (x - mx) * .4f;
         pitch = fmaxf(-85, fminf(85, pitch + (y - my) * .4f));
         mx = x;
@@ -4184,7 +4967,7 @@ int main(int argc, char **argv) {
     if (!getcwd(file_root, sizeof file_root))
         snprintf(file_root, sizeof file_root, "/");
     if (argc == 2 && !strcmp(argv[1], "--version")) {
-        puts("lsm 4.1 | Linux System Monitor | C / OpenGL");
+        puts("lsm 4.3 | Linux System Monitor | C / OpenGL");
         return 0;
     }
     if (argc == 2 && (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h"))) {
@@ -4262,13 +5045,15 @@ int main(int argc, char **argv) {
         ok = files_tests() && ok;
         ok = explore_tests() && ok;
         ok = interaction_tests() && ok;
+        ok = health_tests() && ok;
+        ok = core_plot_tests() && ok;
         return ok ? 0 : 1;
     }
     int ac = 1;
     glutInit(&ac, argv);
     glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGBA | GLUT_DEPTH);
     glutInitWindowSize(width, height);
-    glutCreateWindow("lsm 4.1 | Linux System Monitor | C / OpenGL");
+    glutCreateWindow("lsm 4.3 | Linux System Monitor | C / OpenGL");
     glutSetOption(GLUT_ACTION_ON_WINDOW_CLOSE, GLUT_ACTION_GLUTMAINLOOP_RETURNS);
     font_init();
     glutDisplayFunc(display);

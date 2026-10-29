@@ -11,7 +11,7 @@ Build with `make lsm` (or `make` for both applications), then run:
 ```sh
 ./lsm
 ./lsm --view pressure  # open the new diagnostic dashboard
-./lsm --version        # verify this is lsm 4.1
+./lsm --version        # verify this is lsm 4.3
 ./lsm --view tree      # live 3D process ancestry
 ./lsm --view files --root /home/x1/neural-topology
 ./lsm --view ram       # inspect RAM and process mappings
@@ -59,6 +59,56 @@ to a different monospace TTF file. No root privileges are needed.
 
 ### History and layout controls
 
+Hover an **Overview 3D CPU trace** to see its logical CPU ID, measured usage and
+sample age. Click it to select that CPU, pin the sample, and open **Core details**
+beside the graph. **I** toggles the panel; **Escape** or **Close** closes it.
+In narrow windows the panel replaces the graph until closed. In CPU view,
+select a core and use **Core details / I**. The CPU view covers all collected
+CPU IDs, including those outside Overview's first-128-CPU graph.
+
+Core details include physical core, socket and die IDs; sibling CPU IDs; the
+kernel's raw core type when exposed; busy/user/kernel/idle/I/O-wait percentages;
+reported clock, hardware range, policy min/max and base clock; governor and
+frequency driver; available core temperature; L1 data/instruction and L2/L3
+cache sizes; and the selected window's sample average, peak and count.
+Use **< / >**, **[ / ]**, or left/right arrows to browse cores. Wheel over the
+panel or use up/down/Page Up/Down to scroll its rows.
+
+Hardware fields and rate breakdowns describe the latest displayed snapshot.
+The selected historical sample contains recorded usage only; clocks and
+temperatures do not rewind. Cache instances and core sensors may be shared
+between logical CPUs. Missing fields are labeled unavailable (`?` for missing
+cache sizes). Raw kernel core-type IDs are not guessed to be performance or
+efficiency cores. Static cache/sibling information refreshes when a CPU comes
+online; clock policy and governor readings refresh with normal sampling.
+
+Press **P** or click the palette button to cycle **Spectrum**, **Aurora**, and
+**Ember**. Each resource has a separate accent; warning amber and danger red
+stay consistent across palettes. The palette is kept for the current session.
+
+CPU/core/GPU utilization, system RAM use and dedicated GPU VRAM use turn amber
+at **85%** and red at **95%**. Cards, values, bars and measured graph segments
+use these colors. CPU/RAM/GPU percentage charts shade the warning and danger
+zones; the CPU/GPU 3D graph marks the red 95% boundary.
+
+The status strip names the readings behind **WARNING** or **DANGER ZONE**.
+**SYSTEM OVERLOAD** appears in red when any of these conditions holds:
+
+| Reading | Amber warning | Red overload |
+| --- | --- | --- |
+| 1-minute load / online logical CPU count | 1.0 | 1.5 |
+| PSI `some avg10` (CPU, memory, I/O) | 10% | 25% |
+| PSI `full avg10` (memory, I/O) | 5% | 15% |
+
+These are application display thresholds. Load includes runnable tasks and
+tasks in uninterruptible sleep; PSI measures stalled time. High utilization
+alone is shown as **DANGER ZONE**. Temperatures keep their measured values;
+these percentages do not define hardware temperature limits. Unavailable
+counters remain unavailable, and swap occupancy alone does not trigger overload.
+Process CPU warning colors use total machine capacity, while the displayed
+CPU percentage keeps its existing per-logical-CPU units. A **HELD** prefix
+identifies alerts from a frozen snapshot or a scene held during editing.
+
 The collector now retains **900 samples**, approximately 15 minutes per running
 session. Use the **History** button or V to cycle 1-, 5-, and 15-minute windows.
 The same window applies to 2D histories, core sparklines, and CPU/GPU 3D history.
@@ -90,8 +140,9 @@ levels represent generations. The synthetic **Visible roots** node groups
 processes whose parents are outside the view; it is not a real process. Up to
 4,095 process nodes plus that grouping node can be shown. The header gives
 shown and collected counts. Each node has a minimum projected size for picking;
-CPU activity can increase its size. Cyan indicates your user, purple other
-users, red high CPU, and orange the selected node.
+CPU activity can increase its size. Your user's nodes use the palette's CPU
+accent; other users use its RAM accent. Amber/red mark high use of total CPU
+capacity; orange marks the selected node.
 
 Click a node to select its stable PID/start-time identity. The side panel shows
 PPID, CPU, RAM, command, thread count, and visible direct children. Click a child
@@ -212,6 +263,7 @@ termination is unavailable rather than falling back to a numeric-PID race.
 | --- | --- |
 | `1`–`9` | Overview, CPU, GPU, Processes, Pressure, RAM, Process tree, Filesystem, Manual |
 | `F` | Toggle fullscreen |
+| `P` / palette button | Cycle Spectrum, Aurora, and Ember resource colors |
 | Left-drag node in topology | Reposition its visual layout |
 | Right-drag in topology | Orbit the camera |
 | Middle-drag / Shift+left-drag / drag empty space | Pan the topology view |
@@ -227,11 +279,13 @@ termination is unavailable rather than falling back to a numeric-PID race.
 | `L` in Process tree | Toggle following the selected process family |
 | `/` or click search | Search process name, command or PID |
 | Click process header | Sort; click again to reverse |
-| `I` | Open/close selected process inspector |
+| `I` | Core details in Overview/CPU; process inspector in Processes/Process tree |
+| Click a 3D CPU trace | Select a logical CPU, pin its usage sample, and open core details |
 | `T` / `K` | Open End / Kill dialog for selected process |
 | Enter / Escape in dialog | Confirm / cancel |
 | Escape in search | Leave search |
 | Escape in inspector | Close inspector |
+| Escape in core details | Close the core panel |
 | Escape in topology | Cancel gesture or deselect |
 | Escape elsewhere | Close application |
 
@@ -301,6 +355,13 @@ requests fullscreen. Run graphical tests as your desktop user.
 
 For visual inspection, set `LSM_CAPTURE_DIR` to an existing writable directory
 when running `--smoke`; selected frames are saved there as PPM images.
+Color checks exercise palette switching and normal/warning/danger/overload
+screens using explicitly labeled synthetic snapshots, without creating CPU or
+memory stress. Headless checks cover alert boundaries, unavailable counters,
+CPU-count normalization, VRAM use and overload reason ordering.
+Core checks cover projected trace picking, overlapping traces, missing samples,
+window statistics, click capture across publication, click jitter versus orbit,
+core browsing, scroll bounds, cancel and a narrow viewport.
 
 Sources: [DRM client accounting](https://docs.kernel.org/gpu/drm-usage-stats.html),
 [pidfd signaling](https://man7.org/linux/man-pages/man2/pidfd_send_signal.2.html),

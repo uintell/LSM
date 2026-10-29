@@ -1,4 +1,4 @@
-.TH LSM 1 "2026-10-29" "lsm 4.1" "User Commands"
+.TH LSM 1 "2026-10-29" "lsm 4.3" "User Commands"
 .SH NAME
 lsm \- Linux system monitor with OpenGL graphs and editable 3D topology
 .SH SYNOPSIS
@@ -98,6 +98,10 @@ In-app reference. Scroll with the wheel, arrow keys or Page Up/Down;
 Home and End jump to the beginning and end.
 .SH GENERAL CONTROLS
 .TP
+.B P / palette button
+Cycle Spectrum, Aurora and Ember resource colors for the current session.
+Warning amber and danger red retain their meaning in every palette.
+.TP
 .B F
 Toggle fullscreen.
 .TP
@@ -120,9 +124,29 @@ Resize graph and detail panels in Overview, GPU and topology views.
 Orbit the graph. The wheel or +/\- zooms; R resets its camera.
 .TP
 .B Escape
-Cancel a confirmation, leave a search or close the inspector first.
+Close core details, cancel a confirmation, leave a search or close the inspector first.
 In topology, cancel an active gesture or deselect.
 Elsewhere, exit the application.
+.SH CPU CORE DETAILS
+On Overview, hover a 3D CPU trace to read its logical CPU ID, recorded usage
+and sample age. Click to select that CPU, pin the sample and open its details.
+I toggles the panel; Escape or Close closes it.
+In narrow windows the panel replaces the graph until closed.
+In CPU view, select a core and use Core details or I.
+.PP
+Use the < and > buttons, [ and ], or left/right arrows to browse cores.
+The wheel over the panel and up/down/Page Up/Down scroll its rows.
+CPU view covers all collected IDs, including those outside Overview's
+first-128-CPU plot.
+.PP
+Details include physical core, socket and die IDs, sibling CPU IDs,
+raw kernel core type, utilization breakdown, reported clock, hardware clock
+range, policy min/max, base clock, governor, driver, available core temperature,
+L1 data/instruction and L2/L3 cache sizes, and window sample average/peak/count.
+Missing fields are unavailable; missing cache sizes use a question mark.
+Cache instances and core sensors may be shared among logical CPUs.
+Hardware fields and rate breakdowns are from the latest displayed snapshot.
+Historical selection records usage only and does not rewind clocks or temperatures.
 .SH PROCESS CONTROLS
 In Processes, press / or click the search field to filter by name, command
 or PID. Click a column heading to sort and click it again to reverse.
@@ -239,6 +263,28 @@ engine-level splits. GPU discovery occurs at startup.
 Unavailable counters are labeled unavailable.
 Intel i915 has been tested on the development machine;
 AMD, xe and NVIDIA require validation on their hardware.
+.SH COLORS AND ALERTS
+CPU, core and GPU utilization, system RAM use and dedicated GPU VRAM use
+turn amber at 85 percent and red at 95 percent.
+Cards, values, bars and measured graph segments share these thresholds.
+CPU/RAM/GPU percentage charts shade the warning and danger zones;
+CPU/GPU 3D histories mark the 95-percent boundary.
+.PP
+The header lists readings responsible for WARNING or DANGER ZONE.
+SYSTEM OVERLOAD appears in red when the 1-minute load divided by online
+logical CPU count reaches 1.5, PSI some avg10 reaches 25 percent, or
+memory/I/O PSI full avg10 reaches 15 percent.
+Amber thresholds are load/CPU 1.0, PSI some 10 percent and PSI full 5 percent.
+Load includes runnable tasks and uninterruptible sleep;
+PSI values describe stalled time.
+.PP
+These are application display thresholds for resource use.
+High utilization alone uses DANGER ZONE.
+They do not define hardware temperature limits.
+Unavailable metrics do not create alerts; swap occupancy alone does not
+trigger overload. Process CPU values retain their per-logical-CPU units,
+while their warning colors use total machine CPU capacity.
+HELD identifies alerts from frozen snapshots or scenes held during editing.
 .SH ENVIRONMENT
 .TP
 .B MONITOR_FONT

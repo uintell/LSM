@@ -12,8 +12,8 @@ all: neural-topology lsm
 neural-topology: main.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LDLIBS)
 
-lsm: monitor.c metrics.c metrics.h sampler.c sampler.h memory.c memory.h topology.c topology.h explore.c explore.h interaction.c interaction.h manual.c manual.h
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(shell pkg-config --cflags freetype2) $(LDFLAGS) -o $@ monitor.c metrics.c sampler.c memory.c topology.c explore.c interaction.c manual.c $(LDLIBS) $(shell pkg-config --libs freetype2) -ldl -pthread
+lsm: monitor.c metrics.c metrics.h sampler.c sampler.h memory.c memory.h topology.c topology.h explore.c explore.h interaction.c interaction.h manual.c manual.h health.c health.h coreplot.c coreplot.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(shell pkg-config --cflags freetype2) $(LDFLAGS) -o $@ monitor.c metrics.c sampler.c memory.c topology.c explore.c interaction.c manual.c health.c coreplot.c $(LDLIBS) $(shell pkg-config --libs freetype2) -ldl -pthread
 
 .PHONY: check clean install
 check: neural-topology lsm

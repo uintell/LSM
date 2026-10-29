@@ -4,7 +4,8 @@ const ManualSection lsm_manual[] = {
     {"GETTING STARTED",
      "lsm is a Linux system monitor written in C with OpenGL graphs. Click a tab or press 1-9 "
      "to choose a view. F toggles fullscreen. Space freezes the displayed data while background "
-     "collection continues. Escape closes a dialog or search first; in topology it cancels a "
+     "collection continues. Escape closes core details, a dialog or search first; in topology it "
+     "cancels a "
      "gesture or deselects; elsewhere it exits. This manual scrolls with the wheel, arrow keys "
      "or Page Up/Down. Home/End jump to the start/end."},
     {"THE NINE VIEWS",
@@ -14,12 +15,42 @@ const ManualSection lsm_manual[] = {
      "table. 5 Pressure: CPU, memory and I/O stall percentages. 6 RAM: memory accounting and "
      "largest resident processes. 7 Process tree: live parent/child topology. 8 Filesystem: "
      "directory metadata in 3D. 9 Manual: this reference."},
+    {"COLORS AND DANGER ZONES",
+     "P or the palette button cycles Spectrum, Aurora and Ember for this session. Each resource "
+     "has its own accent; amber and red keep the same meaning in every palette. CPU/core/GPU "
+     "utilization, RAM and dedicated VRAM turn amber at 85% and red at 95%. Percentage histories "
+     "shade the warning/danger zones and color measured samples; the 3D history marks the 95% "
+     "boundary. The header names readings that triggered WARNING or DANGER ZONE. These are "
+     "display thresholds for resource use, not hardware temperature limits."},
+    {"SYSTEM OVERLOAD ALERTS",
+     "SYSTEM OVERLOAD appears in red when 1-minute load divided by online logical CPUs reaches "
+     "1.5, or PSI some avg10 reaches 25%, or memory/I/O PSI full avg10 reaches 15%. Amber starts "
+     "at load/CPU 1.0, PSI some 10%, and PSI full 5%. PSI describes stalled time. High utilization "
+     "alone uses DANGER ZONE. Missing counters stay unavailable. Swap occupancy alone does not "
+     "trigger overload. Process CPU values still use 100% per logical CPU; their warning color "
+     "uses the percentage of total machine CPU capacity. HELD marks a frozen or edited snapshot."},
     {"HISTORY AND LAYOUT",
      "V or the History button cycles 1, 5 and 15 minutes. Up to 900 measured samples are kept "
      "during this session. Hover a 2D graph to inspect a sample; click to pin/unpin its time, "
      "and C clears the shared cursor. This does not rewind tables, topology or memory bytes. "
      "Drag the dividers in Overview, GPU or topology views to resize their panels. CPU/GPU "
      "3D histories use left-drag to orbit, wheel or +/- to zoom, and R to reset the camera."},
+    {"CPU CORE DETAILS",
+     "On Overview, hover a 3D CPU trace to read its measured usage and sample age. Click to "
+     "select the logical CPU, pin that sample and open its details. I toggles the panel; "
+     "Escape or Close closes it. Use < and >, [ and ], or left/right arrows to change cores. "
+     "Wheel over the panel or up/down/Page Up/Down scrolls its rows. In CPU view, select a "
+     "core and press I or Core details to inspect it. Small windows show details in place "
+     "of the graph; close the panel to return. CPU view lists all collected CPU IDs."},
+    {"READING CORE INFORMATION",
+     "Each entry is a logical CPU. Details show physical core/socket/die IDs, sibling CPU "
+     "IDs, raw kernel core type when exposed, busy/user/kernel/idle/I/O-wait percentages, "
+     "reported frequency, hardware frequency range, current policy min/max, base frequency, "
+     "governor, driver and available core temperature. L1 data/instruction and L2/L3 cache "
+     "sizes may describe shared cache instances; core sensors can also be shared by SMT "
+     "siblings. Missing fields are unavailable. Hardware fields are from the latest displayed "
+     "snapshot. Only CPU usage is historical here; a pinned sample does not rewind clocks "
+     "or temperatures. Window average/peak/count use real samples in the selected window."},
     {"PROCESS SEARCH AND INSPECTION",
      "In Processes, click a column heading to sort; click again to reverse. Press / or click "
      "the search box to filter by name, command or PID. Select a row and press I to open its "

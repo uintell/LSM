@@ -9,8 +9,11 @@
 #define HISTORY 900
 
 typedef struct {
-    int id, online, package, core, type;
+    int id, online, package, core, type, die;
     double busy, user, system, iowait, mhz, min_mhz, max_mhz, temperature;
+    double policy_min_mhz, policy_max_mhz, base_mhz;
+    char siblings[128], governor[48], frequency_driver[48];
+    char l1_data[24], l1_instruction[24], l2[24], l3[24];
     uint64_t total, idle, user_ticks, system_ticks, wait_ticks;
 } CpuInfo;
 typedef struct {

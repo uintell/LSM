@@ -32,6 +32,8 @@ static int read_text(const char *path, char *out, size_t size) {
     fclose(f);
     if (ok)
         out[strcspn(out, "\r\n")] = 0;
+    else if (size)
+        *out = 0;
     return ok;
 }
 static double number(const char *path) {
@@ -392,7 +394,8 @@ static void cpu_hardware(void) {
         c->id = i;
         c->temperature = -1;
         c->mhz = c->min_mhz = c->max_mhz = -1;
-        c->package = c->core = c->type = -1;
+        c->package = c->core = c->type = c->die = -1;
+        c->policy_min_mhz = c->policy_max_mhz = c->base_mhz = -1;
     }
 }
 static void temperatures(void) {
@@ -438,12 +441,39 @@ static void temperatures(void) {
     }
     closedir(dir);
 }
+static void cpu_metadata(CpuInfo *c, const char *root) {
+    c->die = (int)field(root, "topology/die_id");
+    field_text(root, "topology/thread_siblings_list", c->siblings, sizeof c->siblings);
+    c->base_mhz = field(root, "cpufreq/base_frequency");
+    if (c->base_mhz >= 0)
+        c->base_mhz /= 1000;
+    c->l1_data[0] = c->l1_instruction[0] = c->l2[0] = c->l3[0] = 0;
+    for (int index = 0; index < 32; index++) {
+        char cache_root[256], type[48], size[24];
+        snprintf(cache_root, sizeof cache_root, "%s/cache/index%d", root, index);
+        int level = (int)field(cache_root, "level");
+        if (level < 0)
+            continue;
+        field_text(cache_root, "type", type, sizeof type);
+        field_text(cache_root, "size", size, sizeof size);
+        char *target = level == 1 && !strcmp(type, "Data")          ? c->l1_data
+                       : level == 1 && !strcmp(type, "Instruction") ? c->l1_instruction
+                       : level == 2                                 ? c->l2
+                       : level == 3                                 ? c->l3
+                                                                    : NULL;
+        if (target)
+            snprintf(target, sizeof c->l2, "%s", size);
+    }
+}
 static void sample_cpus(int baseline) {
     FILE *f = fopen("/proc/stat", "r");
     char line[1024];
     metrics.cpu_count = metrics.cpu_limit = 0;
-    for (int i = 0; i < MAX_CPUS; i++)
+    unsigned char was_online[MAX_CPUS];
+    for (int i = 0; i < MAX_CPUS; i++) {
+        was_online[i] = (unsigned char)metrics.cpus[i].online;
         metrics.cpus[i].online = 0;
+    }
     if (!f)
         return;
     while (fgets(line, sizeof line, f)) {
@@ -480,6 +510,8 @@ static void sample_cpus(int baseline) {
             metrics.cpu_limit = id + 1;
         char root[160];
         snprintf(root, sizeof root, "/sys/devices/system/cpu/cpu%d", id);
+        if (!was_online[id])
+            cpu_metadata(c, root);
         c->package = (int)field(root, "topology/physical_package_id");
         c->core = (int)field(root, "topology/core_id");
         c->type = (int)field(root, "topology/core_type");
@@ -492,6 +524,14 @@ static void sample_cpus(int baseline) {
         c->max_mhz = field(root, "cpufreq/cpuinfo_max_freq");
         if (c->max_mhz >= 0)
             c->max_mhz /= 1000;
+        c->policy_min_mhz = field(root, "cpufreq/scaling_min_freq");
+        c->policy_max_mhz = field(root, "cpufreq/scaling_max_freq");
+        if (c->policy_min_mhz >= 0)
+            c->policy_min_mhz /= 1000;
+        if (c->policy_max_mhz >= 0)
+            c->policy_max_mhz /= 1000;
+        field_text(root, "cpufreq/scaling_governor", c->governor, sizeof c->governor);
+        field_text(root, "cpufreq/scaling_driver", c->frequency_driver, sizeof c->frequency_driver);
         if (metrics.cpu_count == 1)
             field_text(root, "cpufreq/scaling_governor", metrics.governor, sizeof metrics.governor);
     }
